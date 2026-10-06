@@ -5794,54 +5794,302 @@ class DiscordAdapter(DiscordMediaMixin, DiscordThreadTitlesMixin, DiscordVoiceIn
         return await self._send_prompt(chat_id, metadata, _build)
 
     async def send_clarify(
-        self, chat_id: str, question: str, choices: Optional[list], clarify_id: str,
-        session_key: str, metadata: Optional[Dict[str, Any]] = None,
+        self,
+        chat_id: str,
+        question: str,
+        choices: Optional[list],
+        clarify_id: str,
+        session_key: str,
+        metadata: Optional[Dict[str, Any]] = None,
+        content: Optional[str] = None,
     ) -> SendResult:
-        """Clarify prompt: one button per choice plus ``✏️ Other`` (text-capture); with no choices the
-        gateway's text-intercept captures the next message. Dict choices (LLMs emit
-        ``[{"description": ...}]``) are unwrapped via ``label``/``description``/``text``/``title``."""
-        def _flatten_choice(c):
-            if c is None:
-                return ""
-            if isinstance(c, str):
-                return c.strip()
-            if isinstance(c, dict):
-                # 'name'/'value' excluded: Discord-component-shaped fields would leak raw enum values.
-                for key in ("label", "description", "text", "title"):
-                    v = c.get(key)
-                    if isinstance(v, str) and v.strip():
-                        return v.strip()
-                return ""
-            if isinstance(c, (list, tuple)):
-                return " ".join(_flatten_choice(x) for x in c).strip()
-            return str(c).strip()
+        """Render a clarify prompt with one Discord button per choice.
 
-        def _build(_channel):
-            # Header-only card (same rule as the exec approval prompt): the question and hint live
-            # in content only, so embed-rendering clients don't see them twice (#114693).
-            clarify_title = t("platform.discord.prompt.clarify_title")
+        ``content`` (optional) is plain message text sent above the embed. It
+        is used on re-posts to @mention the user so an ignored prompt
+        resurfaces in notifications, and to carry the "waiting" tag.
+
+        Multi-choice mode (``choices`` non-empty): renders a button per option
+        plus a final "✏️ Other (type answer)" button. Picking "Other" flips
+        the clarify entry into text-capture mode so the next user message in
+        the session becomes the response. Numeric clicks resolve immediately
+        via ``resolve_gateway_clarify(clarify_id, choice_text)``.
+
+        Open-ended mode (``choices`` empty/None): renders the question as
+        plain embed text — no buttons. The gateway's text-intercept captures
+        the next message in this session and resolves the clarify.
+
+        Choice normalisation: ``choices`` may contain bare strings OR
+        structured option dicts ``{label, brief, pros, cons}`` (the #1
+        decision helper). Structured dicts render their full brief plus
+        pros/cons in the embed body, with a short selector on the button.
+        Bare strings (and simple ``{"description": "..."}`` dicts) keep the
+        classic single-surface behavior.
+        """
+        if not self._client or not DISCORD_AVAILABLE:
+            return SendResult(success=False, error="Not connected")
+
+        try:
+            target_id = chat_id
+            if metadata and metadata.get("thread_id"):
+                target_id = metadata["thread_id"]
+
+            channel = self._client.get_channel(int(target_id))
+            if not channel:
+                channel = await self._client.fetch_channel(int(target_id))
+
+            # On a re-post (wait-hint present), if no explicit content was
+            # passed, generate the participant @mention so the prompt resurfaces.
+            resend_content = content
+            if (
+                resend_content is None
+                and metadata is not None
+                and metadata.get("_clarify_wait_hint")
+            ):
+                try:
+                    resend_content = await self._clarify_resend_mention(channel)
+                except Exception:
+                    resend_content = None
+
+            # Discord embed description limit is 4096; trim conservatively.
+            max_desc = 4088
+            body = str(question or "").strip()
+            if len(body) > max_desc:
+                body = body[: max_desc - 3] + "..."
+
             embed = discord.Embed(
-                title=_truncate_discord_component_text(f"❓ {clarify_title}", _DISCORD_EMBED_TITLE_LIMIT), color=discord.Color.orange())
-            # 5 buttons × 5 rows = 25; one slot is reserved for "Other".
-            clean_choices = [s for s in (_flatten_choice(c) for c in (choices or [])) if s][:24]
+                title="❓ Hermes needs your input",
+                description=body,
+                color=discord.Color.orange(),
+            )
+
+            # Normalise choices. A choice may be a bare string OR a structured
+            # option dict {label, brief, pros, cons} (the #1 decision helper).
+            # Build the numbered body brief (full text + pros/cons) and keep a
+            # parallel list of short button labels. Garbage dicts with none of
+            # the canonical keys are dropped.
+            clean_choices = [
+                c for c in (choices or []) if _choice_text(c).strip()
+            ]
+            # Discord allows up to 5 buttons per row, 5 rows per view = 25.
+            # We reserve one slot for the "Other" button, so cap at 24.
+            clean_choices = clean_choices[:24]
+
+            # #2 -- surface a live "waiting ~N / time left" tag on re-posts.
+            if metadata is not None and metadata.get("_clarify_wait_hint"):
+                embed.add_field(
+                    name="⏳",
+                    value=metadata["_clarify_wait_hint"],
+                    inline=False,
+                )
+
             if clean_choices:
-                hint = t("platform.discord.prompt.clarify_hint_buttons")
+                # Full-text (+ pros/cons) decision brief in the body; buttons
+                # stay short numbered selectors. Numbers match across both.
+                embed.add_field(
+                    name="How to answer",
+                    value="Pick a number below, or tap ✏️ Other to type your own answer.",
+                    inline=False,
+                )
+                option_blocks = []
+                for i, c in enumerate(clean_choices, 1):
+                    # Bold NATIVE label (stands out) + only the brief/pros/cons
+                    # inside a code box so the indentation survives.
+                    block = [_choice_label_line(i, c)]
+                    detail = _choice_detail_block(c)
+                    if detail:
+                        block.append(f"```\n{detail}\n```")
+                    option_blocks.append("\n".join(block))
+                # Separate each option with a blank line so the brief reads as
+                # distinct choices. Chunk by whole options (never split one
+                # mid-way) to stay under the 1000-char per-field limit.
+                chunks = []
+                cur_chunk, cur_chars = [], 0
+                for block in option_blocks:
+                    cost = len(block) + (2 if cur_chunk else 0)  # "\n\n" join
+                    if cur_chunk and cur_chars + cost > 1000:
+                        chunks.append("\n\n".join(cur_chunk))
+                        cur_chunk, cur_chars = [block], len(block)
+                    else:
+                        cur_chunk.append(block)
+                        cur_chars += cost
+                if cur_chunk:
+                    chunks.append("\n\n".join(cur_chunk))
+                for idx, chunk in enumerate(chunks):
+                    embed.add_field(
+                        name="Options" if idx == 0 else "Options (cont.)",
+                        value=chunk,
+                        inline=False,
+                    )
+                button_choices = [_choice_button_text(c) for c in clean_choices]
                 view = ClarifyChoiceView(
-                    choices=clean_choices, clarify_id=clarify_id,
+                    choices=button_choices,
+                    clarify_id=clarify_id,
                     allowed_user_ids=self._allowed_user_ids,
                     allowed_role_ids=self._allowed_role_ids,
+                    resend=self._make_clarify_resend(
+                        chat_id, question, clean_choices, clarify_id, session_key, metadata,
+                    ),
                 )
             else:
-                hint = t("platform.discord.prompt.clarify_hint_text")
+                embed.add_field(
+                    name="Reply",
+                    value="Reply in this channel with your answer.",
+                    inline=False,
+                )
                 view = None
-            content = self._self_contained_prompt_content(
-                f"❓ **{clarify_title}**", str(question or "").strip(), tail=f"\n\n{hint}",
-            )
-            send_kwargs = {"content": content, "embed": embed}
+
+            # Mirror the question in plain content — embeds are invisible on
+            # some clients (see send_exec_approval). A re-post carries the
+            # @mention content instead.
+            if resend_content is None:
+                clarify_tail = (
+                    "\n\nPick one below, or click ✏️ Other to type a custom answer."
+                    if clean_choices
+                    else "\n\nReply in this channel with your answer."
+                )
+                resend_content = self._self_contained_prompt_content(
+                    "❓ **Hermes needs your input**", str(question or "").strip(),
+                    tail=clarify_tail,
+                )
             if view:
-                send_kwargs["view"] = view
-            return send_kwargs, view
-        return await self._send_prompt(chat_id, metadata, _build, fail_log="send_clarify")
+                msg = await channel.send(content=resend_content, embed=embed, view=view)
+            else:
+                msg = (
+                    await channel.send(content=resend_content, embed=embed)
+                    if resend_content else await channel.send(embed=embed)
+                )
+            if view:
+                view._message = msg  # store for on_timeout expiration editing
+            return SendResult(success=True, message_id=str(msg.id))
+        except Exception as e:
+            logger.warning("[%s] send_clarify failed: %s", self.name, e)
+            return SendResult(success=False, error=str(e))
+
+    async def _clarify_resend_mention(self, channel) -> Optional[str]:
+        """Build the '@name ⬆️ still waiting on your decision' content for a
+        re-posted clarify prompt.
+
+        Mentions the ACTUAL participants of the thread/DM the prompt lives in,
+        so an ignored prompt resurfaces in notifications even under allow-all
+        config (where ``_allowed_user_ids`` is empty). Falls back to the
+        allowlist, then gives up (returns None -> no content/mention)."""
+        ids: set = set()
+        bot_id = None
+        try:
+            bot_id = getattr(getattr(self._client, "user", None), "id", None)
+        except Exception:
+            pass
+        # Thread members -- uses the thread-members API, no privileged intent
+        try:
+            if hasattr(channel, "fetch_members"):
+                for m in await channel.fetch_members():
+                    uid = getattr(m, "id", None)
+                    if uid is not None:
+                        ids.add(str(uid))
+        except Exception:
+            pass
+        # DM recipients
+        try:
+            for m in getattr(channel, "recipients", None) or []:
+                uid = getattr(m, "id", None)
+                if uid is not None:
+                    ids.add(str(uid))
+        except Exception:
+            pass
+        # Fall back to the allowlist if participants yielded nothing
+        if not ids:
+            ids = {str(u) for u in (self._allowed_user_ids or set())}
+        if bot_id is not None:
+            ids.discard(str(bot_id))
+        if not ids:
+            return None
+        mention = "".join(f"<@{u}>" for u in sorted(ids))
+        return f"{mention} ⬆️ still waiting on your decision"
+
+    def _make_clarify_resend(self, chat_id, question, choices, clarify_id,
+                             session_key, metadata):
+        """Return an async closure that re-sends a pending clarify prompt.
+
+        Used by ``ClarifyChoiceView.on_timeout``: when a multiple-choice
+        prompt sits unanswered past the Discord button window, this deletes
+        the expired message and sends a fresh copy (new button window) so the
+        user can still answer — instead of the prompt going dead and leaving
+        the agent thread wedged.  It reuses the SAME ``clarify_id`` and the
+        same ``session_key`` so the gateway entry stays authoritative.
+
+        If the clarify has already been resolved/cleared by the time the
+        timeout fires, the resend no-ops (returns False) so we don't spam a
+        fresh prompt for a question that's already been answered.
+        """
+        async def _resend(old_msg=None):
+            try:
+                from tools.clarify_gateway import get_pending_for_session, get_clarify_timeout
+                import time as _t
+                pending = None
+                if session_key:
+                    # CRITICAL: a multi-choice clarify awaiting a button pick has
+                    # awaiting_text=False, and get_pending_for_session() by
+                    # default only returns free-text entries. Without
+                    # include_choice_prompts=True the resend closure saw None,
+                    # no-oped silently, and left a dead-looking prompt that
+                    # Discord's ~15-min button window then invalidated
+                    # ("interaction failed / didn't respond in time"). Choice
+                    # prompts MUST count as pending for the re-post loop.
+                    pending = get_pending_for_session(
+                        session_key, include_choice_prompts=True,
+                    )
+                if pending is None:
+                    return False
+                # Intent (deliberate): re-post a fresh copy whenever the
+                # clarify is still pending. There is intentionally NO budget
+                # cap here -- the loop is bounded only by the entry's lifetime
+                # (it no-ops once resolved/cleared or the 3h clarify_timeout
+                # fires). A former count-based budget was dead code: every
+                # resend rebuilds this closure fresh, so the counter reset
+                # each cycle and never bounded anything. Removing it keeps the
+                # real intent visible: time stays a blocker, the re-post is
+                # the persistent nudge, and only the user's answer (or the
+                # gateway clearing the entry) stops it.
+
+                # #2 -- stamp each re-post with elapsed / time-left so the
+                # "time is a blocker" model is visible at a glance.
+                def _fmt_dur(secs: float) -> str:
+                    secs = max(0, int(secs))
+                    h, rem = divmod(secs, 3600)
+                    m = rem // 60
+                    return f"{h}h {m:02d}m" if h else f"{m}m"
+
+                elapsed = max(0, int(_t.time() - getattr(pending, "asked_at", _t.time())))
+                window = max(0, int(get_clarify_timeout()))
+                left = max(0, window - elapsed)
+                wait_hint = f"⏳ Waiting ~{_fmt_dur(elapsed)} · ~{_fmt_dur(left)} left"
+
+                # Delete the old expired prompt if we can.
+                if old_msg is not None:
+                    try:
+                        await old_msg.delete()
+                    except Exception:
+                        pass
+                # Send a fresh copy with the wait tag. The @mention (thread
+                # participants) and its content string are computed inside
+                # send_clarify from the live channel, because the allowlist
+                # (`_allowed_user_ids`) may be empty under allow-all config.
+                res_meta = dict(metadata or {})
+                res_meta["_clarify_wait_hint"] = wait_hint
+                res = await self.send_clarify(
+                    chat_id=chat_id,
+                    question=question,
+                    choices=choices,
+                    clarify_id=clarify_id,
+                    session_key=session_key,
+                    metadata=res_meta,
+                )
+                return bool(res.success)
+            except Exception:
+                return False
+
+        return _resend
 
     async def send_update_prompt(
         self, chat_id: str, prompt: str, default: str = "", session_key: str = "",
@@ -6396,6 +6644,99 @@ def _resolve_exec_approval_admin_gate(config_extra: Optional[dict]) -> Tuple[boo
     return (True, admin_ids)
 
 
+# =========================================================================
+# Clarify choice helpers -- normalize a raw choice (str OR structured option
+# dict {label, brief, pros, cons}) into the text the different surfaces need.
+# Structured option dicts power the #1 "real decision helper": the embed body
+# shows each option's full brief plus pros/cons, while buttons stay short
+# selectors. Bare strings keep the classic behavior end-to-end.
+# =========================================================================
+
+def _choice_text(c) -> str:
+    """User-facing text for a raw choice (str or option dict) -- used to test
+    existence and as a plain fallback. For a dict, prefers brief/label/
+    description/text/title in that order (the canonical LLM tool-call keys)."""
+    if isinstance(c, dict):
+        for key in ("brief", "label", "description", "text", "title"):
+            v = c.get(key)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+        return ""
+    if isinstance(c, (list, tuple)):
+        return " ".join(x for x in (_choice_text(x) for x in c) if x).strip()
+    if c is None:
+        return ""
+    return str(c).strip()
+
+
+def _choice_button_text(c) -> str:
+    """Short selector text for the button base -- the option's short label for a
+    structured dict, else the full text for a bare string."""
+    if isinstance(c, dict):
+        for key in ("label", "brief", "description", "text", "title"):
+            v = c.get(key)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+        return ""
+    return _choice_text(c)
+
+
+def _choice_resolve_text(c) -> str:
+    """The answer string resolved back to the agent when this choice is picked.
+    For a structured option, prefer the full ``brief`` (then ``description``)
+    so the agent receives the substance, falling back to the short label."""
+    if isinstance(c, dict):
+        for key in ("brief", "description"):
+            v = c.get(key)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+        for key in ("label", "text", "title"):
+            v = c.get(key)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+        return ""
+    return _choice_text(c)
+
+
+def _choice_label_line(i: int, c) -> str:
+    """Native (non-code) option header: '**1. Label** -- brief'. The label is
+    bold so the option stands out; a structured option's brief rides on the
+    same line after ' -- ' (kept out of the mono box)."""
+    label = _choice_button_text(c)
+    if not label:
+        return f"**{i}. (option)**"
+    if isinstance(c, dict):
+        brief = c.get("brief") or c.get("description")
+        if isinstance(brief, str) and brief.strip() and brief.strip() != label:
+            return f"**{i}. {label}** -- {brief.strip()}"
+    return f"**{i}. {label}**"
+
+
+def _choice_detail_block(c) -> Optional[str]:
+    """Inner text of the indented code box for a structured option -- ONLY the
+    pros/cons (the brief already lives on the option's label line). Returns
+    None (no code box) for a bare-string option."""
+    if not isinstance(c, dict):
+        return None
+    lines: list = []
+    pros = c.get("pros") or []
+    if pros:
+        lines.append("   ✅ Pros:")
+        for x in pros:
+            s = str(x).strip()
+            if s:
+                lines.append(f"      • {s}")
+    cons = c.get("cons") or []
+    if cons:
+        lines.append("")
+        lines.append("   ❌ Cons:")
+        for x in cons:
+            s = str(x).strip()
+            if s:
+                lines.append(f"      • {s}")
+    return "\n".join(lines) if lines else None
+
+
 def _define_discord_view_classes() -> None:
     """Register Discord UI view classes as module globals.
     Called at module load and after a lazy install so the classes exist whenever DISCORD_AVAILABLE."""
@@ -6895,17 +7236,77 @@ def _define_discord_view_classes() -> None:
                     pass
 
     class ClarifyChoiceView(_HermesView):
-        """One button per clarify choice (max 24) plus ``✏️ Other``. A numeric click resolves the
-        gateway clarify entry immediately; ``Other`` flips to text-capture (next message answers).
-        Single-use: after the first valid click all buttons disable."""
+        """One button per clarify choice (max 24) plus ``✏️ Other``.
 
-        def __init__(self, choices: List[str], clarify_id: str, allowed_user_ids: set, allowed_role_ids: Optional[set] = None):
+        Picking a numeric choice resolves the gateway clarify entry immediately;
+        picking ``Other`` flips the entry into text-capture mode so the next
+        user message in the session becomes the response (the gateway's
+        text-intercept handles the resolution).
+
+        Auth gating mirrors ``ExecApprovalView`` — only users/roles in the
+        Discord adapter's allowlist may answer. Single-use: after the first
+        valid click all buttons disable and the embed updates to show who
+        answered and what they chose.
+        """
+
+        def __init__(
+            self,
+            choices: List[str],
+            clarify_id: str,
+            allowed_user_ids: set,
+            allowed_role_ids: Optional[set] = None,
+            resend: Optional[Callable] = None,
+        ):
             super().__init__(allowed_user_ids, allowed_role_ids, timeout=_read_discord_prompt_timeout())
             self.choices = list(choices)[:24]
             self.clarify_id = clarify_id
+            self._resend = resend
+
             for index, choice in enumerate(self.choices):
+                # Button shows a SHORT selector (number + tight label) -- the
+                # FULL option text lives in the embed body (see send_clarify's
+                # "Options" fields), so the user reads the actual answer there
+                # instead of a cut-off label. On mobile Discord only ~40 chars
+                # are visible comfortably, so aim well under that.
+                #
+                # Cut strategy (most-preferred to least-preferred):
+                #   1. Last space in the trailing half of the budget
+                #      (cleanest word boundary)
+                #   2. Last soft boundary in the trailing half of the
+                #      budget (hyphen, comma, period, paren)
+                #   3. Hard cut at the budget limit (last resort)
+                prefix = f"{index + 1}. "
+                budget = 24 - utf16_len(prefix)  # short selector label; full text in body
+                if utf16_len(choice) <= budget:
+                    label_body = choice
+                else:
+                    truncated = _prefix_within_utf16_limit(
+                        choice,
+                        max(0, budget - utf16_len(_DISCORD_ELLIPSIS)),
+                    ).rstrip()
+                    cut_at = -1
+                    # 1. Last space in the trailing half of the budget.
+                    space = truncated.rfind(" ")
+                    if space >= len(truncated) // 2:
+                        cut_at = space
+                    # 2. Soft boundary — only if no word boundary found.
+                    # Find the latest soft boundary in the trailing half
+                    # of the budget; that maximizes preserved text length.
+                    # Cut AT the soft boundary (inclusive) so the label
+                    # ends on the soft char (e.g. "-" or ",") rather than
+                    # on the alpha char that followed it.
+                    if cut_at < 0:
+                        latest_soft = max(
+                            (truncated.rfind(s) for s in ("-", ",", ".", ")")),
+                            default=-1,
+                        )
+                        if latest_soft >= len(truncated) // 2:
+                            cut_at = latest_soft + 1
+                    if cut_at > 0:
+                        truncated = truncated[:cut_at]
+                    label_body = truncated.rstrip() + _DISCORD_ELLIPSIS
                 button = discord.ui.Button(
-                    label=self._button_label(index, choice), style=discord.ButtonStyle.primary,
+                    label=f"{prefix}{label_body}", style=discord.ButtonStyle.primary,
                     custom_id=f"clarify:{clarify_id}:{index}",
                 )
                 button.callback = self._make_choice_callback(index, choice)
@@ -6979,7 +7380,9 @@ def _define_discord_view_classes() -> None:
                 from tools.clarify_gateway import _entries as _clarify_entries  # type: ignore
                 entry = _clarify_entries.get(self.clarify_id)
                 if entry and entry.choices and 0 <= index < len(entry.choices):
-                    resolved_text = entry.choices[index]
+                    # Round-trip canonical text -- may be a bare string OR a
+                    # structured option dict (resolve to its brief/label).
+                    resolved_text = _choice_resolve_text(entry.choices[index])
             except Exception:
                 resolved_text = None
             if resolved_text is None:
